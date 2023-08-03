@@ -1,7 +1,8 @@
-opencv-python==4.1.1.26
+opencv-python>=4
 lxml
 tqdm
-tensorflow==2.3.0rc0
+tensorflow>=2
+tensorflow-metal
 absl-py
 easydict
 matplotlib
