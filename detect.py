@@ -2,6 +2,7 @@ import tensorflow as tf
 physical_devices = tf.config.experimental.list_physical_devices('GPU')
 if len(physical_devices) > 0:
     tf.config.experimental.set_memory_growth(physical_devices[0], True)
+from core.yolov4 import YOLO, decode, filter_boxes
 from absl import app, flags, logging
 from absl.flags import FLAGS
 import core.utils as utils
@@ -10,63 +11,66 @@ from tensorflow.python.saved_model import tag_constants
 from PIL import Image
 import cv2
 import numpy as np
-from tensorflow.compat.v1 import ConfigProto
-from tensorflow.compat.v1 import InteractiveSession
+import time
+import os
 
 flags.DEFINE_string('framework', 'tf', '(tf, tflite, trt')
-flags.DEFINE_string('weights', './checkpoints/yolov4-416',
+flags.DEFINE_string('weights', './checkpoints/yolov4-tiny.h5',
                     'path to weights file')
-flags.DEFINE_integer('size', 416, 'resize images to')
-flags.DEFINE_boolean('tiny', False, 'yolo or yolo-tiny')
+flags.DEFINE_integer('size', 640, 'resize images to')
+flags.DEFINE_boolean('tiny', True, 'yolo or yolo-tiny')
 flags.DEFINE_string('model', 'yolov4', 'yolov3 or yolov4')
-flags.DEFINE_string('image', './data/kite.jpg', 'path to input image')
-flags.DEFINE_string('output', 'result.png', 'path to output image')
+flags.DEFINE_string('source', '0', 'image source')
 flags.DEFINE_float('iou', 0.45, 'iou threshold')
-flags.DEFINE_float('score', 0.25, 'score threshold')
+flags.DEFINE_float('score', 0.2, 'score threshold')
 
-def main(_argv):
-    config = ConfigProto()
-    config.gpu_options.allow_growth = True
-    session = InteractiveSession(config=config)
+def yolo_for_inference():
     STRIDES, ANCHORS, NUM_CLASS, XYSCALE = utils.load_config(FLAGS)
-    input_size = FLAGS.size
-    image_path = FLAGS.image
 
-    original_image = cv2.imread(image_path)
-    original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+    input_layer = tf.keras.layers.Input([FLAGS.size, FLAGS.size, 3])
+    feature_maps = YOLO(input_layer, NUM_CLASS, FLAGS.model, FLAGS.tiny)
+    bbox_tensors = []
+    prob_tensors = []
 
-    # image_data = utils.image_preprocess(np.copy(original_image), [input_size, input_size])
-    image_data = cv2.resize(original_image, (input_size, input_size))
-    image_data = image_data / 255.
-    # image_data = image_data[np.newaxis, ...].astype(np.float32)
-
-    images_data = []
-    for i in range(1):
-        images_data.append(image_data)
-    images_data = np.asarray(images_data).astype(np.float32)
-
-    if FLAGS.framework == 'tflite':
-        interpreter = tf.lite.Interpreter(model_path=FLAGS.weights)
-        interpreter.allocate_tensors()
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
-        print(input_details)
-        print(output_details)
-        interpreter.set_tensor(input_details[0]['index'], images_data)
-        interpreter.invoke()
-        pred = [interpreter.get_tensor(output_details[i]['index']) for i in range(len(output_details))]
-        if FLAGS.model == 'yolov3' and FLAGS.tiny == True:
-            boxes, pred_conf = filter_boxes(pred[1], pred[0], score_threshold=0.25, input_shape=tf.constant([input_size, input_size]))
+    for i, fm in enumerate(feature_maps):
+        if i == 0:
+            output_tensors = decode(fm, FLAGS.size // 16, NUM_CLASS, STRIDES, ANCHORS, i, XYSCALE, FLAGS.framework)
         else:
-            boxes, pred_conf = filter_boxes(pred[0], pred[1], score_threshold=0.25, input_shape=tf.constant([input_size, input_size]))
-    else:
-        saved_model_loaded = tf.saved_model.load(FLAGS.weights, tags=[tag_constants.SERVING])
-        infer = saved_model_loaded.signatures['serving_default']
-        batch_data = tf.constant(images_data)
-        pred_bbox = infer(batch_data)
-        for key, value in pred_bbox.items():
-            boxes = value[:, :, 0:4]
-            pred_conf = value[:, :, 4:]
+            output_tensors = decode(fm, FLAGS.size // 32, NUM_CLASS, STRIDES, ANCHORS, i, XYSCALE, FLAGS.framework)
+    bbox_tensors.append(output_tensors[0])
+    prob_tensors.append(output_tensors[1])
+
+    pred_bbox = tf.concat(bbox_tensors, axis=1)
+    pred_prob = tf.concat(prob_tensors, axis=1)
+
+    boxes, pred_conf = filter_boxes(pred_bbox, pred_prob, score_threshold=FLAGS.score, input_shape=tf.constant([FLAGS.size, FLAGS.size]))
+    pred = tf.concat([boxes, pred_conf], axis=-1)
+
+    model = tf.keras.Model(input_layer, pred)
+    # utils.load_weights(model, FLAGS.weights, FLAGS.model, FLAGS.tiny)
+    model.load_weights(FLAGS.weights)
+    model.summary()
+
+    # if os.path.exists(FLAGS.weights):
+    #     model.load_weights(FLAGS.weights)
+    # else:
+    #     model.save(FLAGS.weights)
+
+    return model
+
+def preprocess(frame, input_size):
+    frame_size = frame.shape[:2]
+    image_data = cv2.resize(frame, (input_size, input_size))
+    image_data = image_data / 255.
+    return tf.constant(np.asarray([image_data]).astype(np.float32))
+    # return image_data[np.newaxis, ...].astype(np.float32)
+
+@tf.function
+def infer(model, X):
+    pred_bbox = model(X)
+    for key, value in pred_bbox.items():
+        boxes = value[:, :, 0:4]
+        pred_conf = value[:, :, 4:]
 
     boxes, scores, classes, valid_detections = tf.image.combined_non_max_suppression(
         boxes=tf.reshape(boxes, (tf.shape(boxes)[0], -1, 1, 4)),
@@ -77,13 +81,43 @@ def main(_argv):
         iou_threshold=FLAGS.iou,
         score_threshold=FLAGS.score
     )
-    pred_bbox = [boxes.numpy(), scores.numpy(), classes.numpy(), valid_detections.numpy()]
-    image = utils.draw_bbox(original_image, pred_bbox)
-    # image = utils.draw_bbox(image_data*255, pred_bbox)
-    image = Image.fromarray(image.astype(np.uint8))
-    image.show()
-    image = cv2.cvtColor(np.array(image), cv2.COLOR_BGR2RGB)
-    cv2.imwrite(FLAGS.output, image)
+    return boxes, scores, classes, valid_detections
+
+def main(_argv):
+    input_size = FLAGS.size
+    source = FLAGS.source
+
+    try:
+        source = int(source)
+    except:
+        pass
+
+    model = yolo_for_inference()
+    vid = cv2.VideoCapture(source)
+
+    frame_id = 0
+    while True:
+        return_value, frame = vid.read()
+        if return_value:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        else:
+            if frame_id == vid.get(cv2.CAP_PROP_FRAME_COUNT):
+                print("Video processing complete")
+                break
+            raise ValueError("No image! Try with another video format")
+        
+
+        X = preprocess(frame, input_size)
+        boxes, scores, classes, valid_detections = infer(model, X)
+        pred_bbox = [boxes.numpy(), scores.numpy(), classes.numpy(), valid_detections.numpy()]
+        image = utils.draw_bbox(frame, pred_bbox)
+        result = np.asarray(image)
+        result = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        cv2.namedWindow("result", cv2.WINDOW_AUTOSIZE)
+        cv2.imshow("result", result)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+        frame_id += 1
 
 if __name__ == '__main__':
     try:
